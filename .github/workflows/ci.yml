@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            clang mold pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-xkb-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
@@ -56,7 +56,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            clang mold pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
             libxcb1-dev libxcb-xkb-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
             libvulkan-dev libssl-dev
       - uses: dtolnay/rust-toolchain@stable
