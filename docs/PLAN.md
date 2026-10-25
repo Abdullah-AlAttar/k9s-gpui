@@ -133,7 +133,9 @@ Autocomplete for `:`, `-l` label selectors, per-context config (persisted favour
 5. Mouse text selection in viewers.
 
 ### N5 — More resource kinds
-Generic `ResourceKind` registry: deploy, sts, ds, job, cronjob, svc, node, ns, cm, secret, events, CRDs; per-kind actions (scale, restart, cordon/drain); `shift-j` jump to owner, `o` show node.
+Done: `k9s_core::Kind` registry (po, deploy, sts, ds, rs, job, cj, svc, ing, cm, sec, pvc, ev, no) switched with `:<alias>`; per-kind table renderers in `k9s_render::resources`; YAML, describe (pods: native layout; others: manifest + events) and delete are generic; Enter on a workload or node drills into its pods (name-regex filter). Secret values are never shown in the table. Text viewers (YAML/describe) highlight search matches (`n` / `shift-n` jump) instead of filtering.
+Actions (need `--write`): `:scale N`, `:restart`, `:cordon`, `:uncordon` on the selected row (not live-tested against a cluster).
+Left: namespaces and CRDs (discovery-based), drain, `shift-j` jump to owner, `o` show node, label-selector-accurate drill-down (currently a name pattern).
 
 ### N6 — Later
 Port-forward, skins, aliases/hotkeys/plugins, xray, pulse, watch-based updates (`kube::runtime::watcher`), screenshot tests, packaging (nix package, release CI).

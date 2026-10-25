@@ -22,6 +22,6 @@ pub struct ClusterStats {
 pub enum Update {
     Info(ClusterInfo),
     Stats(ClusterStats),
-    Pods(TableData),
+    Table(TableData),
     Error(String),
 }

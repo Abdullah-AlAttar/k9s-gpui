@@ -6,3 +6,4 @@ pub mod describe;
 pub mod log;
 pub mod metrics;
 pub mod pod;
+pub mod resources;

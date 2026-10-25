@@ -366,6 +366,12 @@ pub fn pod(pod: &Pod, events: &[Event], now: i64) -> String {
         }
     }
 
+    events_section(&mut out, events, now);
+    out
+}
+
+/// Appends the `Events:` table shared by every describe view.
+fn events_section(out: &mut String, events: &[Event], now: i64) {
     let _ = writeln!(out, "Events:");
     if events.is_empty() {
         let _ = writeln!(out, "  <none>");
@@ -396,6 +402,12 @@ pub fn pod(pod: &Pod, events: &[Event], now: i64) -> String {
             );
         }
     }
+}
+
+/// Describe for kinds without a dedicated layout: the manifest followed by its events.
+pub fn generic(manifest: &str, events: &[Event], now: i64) -> String {
+    let mut out = format!("{}\n\n", manifest.trim_end());
+    events_section(&mut out, events, now);
     out
 }
 

@@ -1,6 +1,6 @@
 //! Application state and the worker-to-UI bridge.
 
-pub use k9s_core::{ClusterInfo, ClusterStats, Update};
+pub use k9s_core::{ClusterInfo, ClusterStats, Kind, Update};
 pub use k9s_kube::Options;
 
 /// Starts the cluster worker and returns the stream of updates for the UI.
@@ -21,10 +21,11 @@ pub use k9s_kube::TextKind;
 pub fn fetch_text(
     options: Options,
     kind: TextKind,
+    resource: Kind,
     namespace: String,
     name: String,
 ) -> async_channel::Receiver<Result<String, String>> {
-    k9s_kube::fetch_text(options, kind, namespace, name)
+    k9s_kube::fetch_text(options, kind, resource, namespace, name)
 }
 
 /// Container table of one pod, delivered once.
@@ -47,11 +48,25 @@ pub fn stream_logs(
     k9s_kube::stream_logs(options, namespace, name, container, previous)
 }
 
-/// Deletes one pod; the result is delivered once.
-pub fn delete_pod(
+/// Deletes one resource; the result is delivered once.
+pub fn delete_resource(
     options: Options,
+    kind: Kind,
     namespace: String,
     name: String,
 ) -> async_channel::Receiver<Result<(), String>> {
-    k9s_kube::delete_pod(options, namespace, name)
+    k9s_kube::delete_resource(options, kind, namespace, name)
+}
+
+pub use k9s_kube::Action;
+
+/// Runs a scale/restart/cordon action; the confirmation message is delivered once.
+pub fn run_action(
+    options: Options,
+    kind: Kind,
+    namespace: String,
+    name: String,
+    action: Action,
+) -> async_channel::Receiver<Result<String, String>> {
+    k9s_kube::run_action(options, kind, namespace, name, action)
 }

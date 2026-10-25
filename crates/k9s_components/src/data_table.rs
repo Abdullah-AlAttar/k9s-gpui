@@ -23,7 +23,8 @@ actions!(
         SortStatus,
         ToggleWide,
         ToggleFaults,
-        Confirm
+        Confirm,
+        NextMatch
     ]
 );
 
@@ -53,6 +54,7 @@ pub fn bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-w", ToggleWide, c),
         KeyBinding::new("ctrl-z", ToggleFaults, c),
         KeyBinding::new("enter", Confirm, c),
+        KeyBinding::new("n", NextMatch, c),
     ]
 }
 
@@ -62,6 +64,10 @@ pub struct Open(pub String);
 pub struct DataTable {
     source: TableData,
     filter: String,
+    /// Viewer mode: the filter highlights matches and `n`/`shift-n` jump between them.
+    search: bool,
+    matcher: Option<regex::Regex>,
+    matches: Vec<usize>,
     wide: bool,
     faults: bool,
     data: TableData,
@@ -81,6 +87,9 @@ impl DataTable {
         Self {
             source: data.clone(),
             filter: String::new(),
+            search: false,
+            matcher: None,
+            matches: Vec::new(),
             wide: false,
             faults: false,
             data,
@@ -157,6 +166,39 @@ impl DataTable {
         self.rebuild(cx);
     }
 
+    /// Switches the filter between narrowing rows and highlighting matches.
+    pub fn set_search_mode(&mut self, search: bool, cx: &mut Context<Self>) {
+        self.search = search;
+        self.rebuild(cx);
+    }
+
+    /// (1-based index of the nearest match at or after the cursor, total matches).
+    pub fn match_status(&self) -> Option<(usize, usize)> {
+        if !self.search || self.matches.is_empty() {
+            return None;
+        }
+        let at = self.matches.iter().position(|m| *m >= self.selected);
+        Some((at.map_or(1, |i| i + 1), self.matches.len()))
+    }
+
+    fn step_match(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let next = if forward {
+            self.matches
+                .iter()
+                .find(|m| **m > self.selected)
+                .or(self.matches.first())
+        } else {
+            self.matches
+                .iter()
+                .rev()
+                .find(|m| **m < self.selected)
+                .or(self.matches.last())
+        };
+        if let Some(ix) = next.copied() {
+            self.select(ix, cx);
+        }
+    }
+
     pub fn wide(&self) -> bool {
         self.wide
     }
@@ -209,19 +251,48 @@ impl DataTable {
         if self.faults {
             data.rows.retain(|r| r.fault);
         }
-        if let Some(re) = matcher.filter(|_| !pattern.is_empty()) {
-            data.rows
-                .retain(|r| r.cells.iter().any(|c| re.is_match(c)) != inverse);
+        let matcher = matcher.filter(|_| !pattern.is_empty());
+        if self.search {
+            self.matcher = matcher;
+        } else {
+            self.matcher = None;
+            if let Some(re) = matcher {
+                data.rows
+                    .retain(|r| r.cells.iter().any(|c| re.is_match(c)) != inverse);
+            }
         }
         self.data = data;
         if let Some(key) = self.sort {
             self.data.sort(key);
         }
+        self.matches = match &self.matcher {
+            Some(re) => (0..self.data.rows.len())
+                .filter(|i| {
+                    self.data
+                        .rows
+                        .get(*i)
+                        .is_some_and(|r| r.cells.iter().any(|c| re.is_match(c)))
+                })
+                .collect(),
+            None => Vec::new(),
+        };
         // Keep the cursor on the same row when the list changes underneath it.
         let moved = selected_id.and_then(|id| self.data.rows.iter().position(|r| r.id == id));
         self.selected = moved
             .unwrap_or(self.selected)
             .min(self.data.rows.len().saturating_sub(1));
+        // While typing a search, land on the first match at or below the cursor.
+        if let Some(ix) = self
+            .matches
+            .iter()
+            .find(|m| **m >= self.selected)
+            .or(self.matches.first())
+            .copied()
+            .filter(|_| !self.matches.contains(&self.selected) && self.search)
+        {
+            self.selected = ix;
+            self.scroll.scroll_to_item(ix, ScrollStrategy::Center);
+        }
         cx.notify();
     }
 
@@ -291,12 +362,17 @@ impl DataTable {
                         .pr(px(self.char_px))
                         .overflow_hidden()
                         .whitespace_nowrap();
+                    let hit = self.matcher.as_ref().filter(|re| re.is_match(cell));
                     c = if i == 0 && !row.spans.is_empty() {
                         // Keep the selection readable: no tone colours on the cursor row.
-                        c.flex().flex_row().children(row.spans.iter().map(|span| {
-                            let color = if selected { fg } else { t.tone(span.tone) };
-                            div().text_color(rgb(color)).child(span.text.clone())
-                        }))
+                        c.flex()
+                            .flex_row()
+                            .children(row.spans.iter().flat_map(|span| {
+                                let color = if selected { fg } else { t.tone(span.tone) };
+                                highlight(&span.text, hit, color, &t)
+                            }))
+                    } else if hit.is_some() {
+                        c.flex().flex_row().children(highlight(cell, hit, fg, &t))
                     } else {
                         c.child(cell.clone())
                     };
@@ -309,6 +385,32 @@ impl DataTable {
             })
             .collect()
     }
+}
+
+/// Splits `text` into pieces, giving regex matches the search colours.
+fn highlight(text: &str, re: Option<&regex::Regex>, color: u32, t: &Theme) -> Vec<gpui::Div> {
+    let piece = |s: &str| div().text_color(rgb(color)).child(s.to_owned());
+    let Some(re) = re else {
+        return vec![piece(text)];
+    };
+    let mut out = Vec::new();
+    let mut last = 0;
+    for m in re.find_iter(text) {
+        if m.start() > last {
+            out.push(piece(text.get(last..m.start()).unwrap_or_default()));
+        }
+        out.push(
+            div()
+                .bg(rgb(t.warn))
+                .text_color(rgb(t.selection_fg))
+                .child(m.as_str().to_owned()),
+        );
+        last = m.end();
+    }
+    if last < text.len() {
+        out.push(piece(text.get(last..).unwrap_or_default()));
+    }
+    out
 }
 
 impl EventEmitter<Open> for DataTable {}
@@ -402,7 +504,14 @@ impl Render for DataTable {
                 this.faults = !this.faults;
                 this.rebuild(cx);
             }))
-            .on_action(cx.listener(|this, _: &SortName, _, cx| this.sort_by_header("NAME", cx)))
+            .on_action(cx.listener(|this, _: &NextMatch, _, cx| this.step_match(true, cx)))
+            .on_action(cx.listener(|this, _: &SortName, _, cx| {
+                if this.search {
+                    this.step_match(false, cx);
+                } else {
+                    this.sort_by_header("NAME", cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SortAge, _, cx| this.sort_by_header("AGE", cx)))
             .on_action(cx.listener(|this, _: &SortStatus, _, cx| this.sort_by_header("STATUS", cx)))
             .child(

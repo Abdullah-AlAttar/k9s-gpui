@@ -8,6 +8,8 @@ A native, GPU-accelerated desktop replica of [k9s](https://k9scli.io), built wit
 ## Features
 
 - Live pod table with k9s columns, metrics (CPU/MEM, % of requests/limits), wide mode and a faults-only filter
+- Browse pods, deployments, statefulsets, daemonsets, replicasets, jobs, cronjobs, services, ingresses, configmaps, secrets, PVCs, events and nodes: `:deploy`, `:svc`, `:no`, `:po`, ... (YAML and describe for all kinds, logs for pods; Enter on a workload or node drills into its pods)
+- With `--write`: `:scale N`, `:restart` (deploy/sts/ds), `:cordon` / `:uncordon` (nodes) on the selected row
 - `/` regex filter, `:` command bar with history, `:ctx` / `:ns` pickers, favourite namespaces (`0`-`9`)
 - YAML (`y`), native describe (`d`, pod + events), container view, streaming and previous logs
 - Logs: JSON rendering with colours (`t`), ANSI colours, wrap (`w`), copy line (`c`) / all visible (`shift-c`)

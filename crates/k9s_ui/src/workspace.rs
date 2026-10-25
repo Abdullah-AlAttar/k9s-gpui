@@ -4,7 +4,7 @@ use gpui::{
     App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, KeyBinding, Render,
     Subscription, Task, Window, actions, div, prelude::*, px, rgb,
 };
-use k9s_app::{ClusterInfo, ClusterStats, Options, TextKind, Update};
+use k9s_app::{Action, ClusterInfo, ClusterStats, Kind, Options, TextKind, Update};
 use k9s_components::{DEFAULT_FONT_PX, DataTable, FONT, Open, data_table_bindings, theme::Theme};
 use k9s_core::{Column, Row, RowKind, Span, TableData, Tone};
 
@@ -56,6 +56,28 @@ struct Picker {
     kind: PickerKind,
     table: Entity<DataTable>,
     _open: Subscription,
+}
+
+/// Pod-name (or node) regex that selects the pods owned by the resource `id` (`ns/name`).
+fn drill_filter(kind: Kind, id: &str) -> Option<String> {
+    let name = regex_escape(id.split_once('/')?.1);
+    match kind {
+        Kind::Deployment => Some(format!("^{name}-[^-]+-[^-]+$")),
+        Kind::StatefulSet | Kind::DaemonSet | Kind::ReplicaSet | Kind::Job => {
+            Some(format!("^{name}-[^-]+$"))
+        }
+        Kind::Node => Some(format!("^{name}$")),
+        _ => None,
+    }
+}
+
+fn regex_escape(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| {
+            let escape = !c.is_alphanumeric() && c != '-' && c != '_';
+            escape.then_some('\\').into_iter().chain([c])
+        })
+        .collect()
 }
 
 fn picker_data(title: &str, items: &[String], current: &str) -> TableData {
@@ -127,7 +149,8 @@ const CONTAINER_HINTS: &[(&str, &str)] = &[
 ];
 
 const TEXT_HINTS: &[(&str, &str)] = &[
-    ("/", "Filter"),
+    ("/", "Search"),
+    ("n/shift-n", "Next/Prev Match"),
     ("j/k", "Scroll"),
     ("g", "Top"),
     ("shift-g", "Bottom"),
@@ -155,11 +178,14 @@ const HELP: &[(&str, &str)] = &[
     ("g / G", "top / bottom"),
     ("ctrl-f / ctrl-b", "page down / up"),
     ("/", "filter (regex, `!` inverts)"),
-    (":", "command: ns, ctx, pods, q (↑/↓ history)"),
+    (
+        ":",
+        "command: ns, ctx, q, or a kind: po deploy sts ds rs job cj svc ing cm sec pvc ev no",
+    ),
     ("shift-n / a / s", "sort by name / age / status"),
     (
         "y / d / l / p",
-        "YAML / describe / logs / previous logs of the pod",
+        "YAML / describe / logs / previous logs (pods)",
     ),
     ("ctrl-w", "toggle wide columns"),
     ("ctrl-z", "toggle faults only"),
@@ -170,7 +196,7 @@ const HELP: &[(&str, &str)] = &[
         "c / shift-c",
         "YAML/describe/logs: copy line / all visible lines",
     ),
-    ("ctrl-d", "delete pod (needs --write; asks to confirm)"),
+    ("ctrl-d", "delete resource (needs --write; asks to confirm)"),
     ("esc", "close help or picker, clear filter"),
     ("0-9", "switch to favourite namespace"),
     ("q / ctrl-c", "quit"),
@@ -272,9 +298,15 @@ impl Workspace {
     pub fn new(updates: Receiver<Update>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let theme = Theme::default();
         let table = cx.new(|cx| DataTable::new(TableData::default(), theme, cx));
-        let open_pod = cx.subscribe_in(&table, window, |this, _, Open(_): &Open, window, cx| {
+        let open_pod = cx.subscribe_in(&table, window, |this, _, Open(id): &Open, window, cx| {
             if this.picker.is_none() {
-                this.begin_logs(None, window, cx);
+                match this.options.kind {
+                    Kind::Pod => this.begin_logs(None, window, cx),
+                    kind => match drill_filter(kind, id) {
+                        Some(filter) => this.show_pods(&filter, cx),
+                        None => this.open_text(TextKind::Yaml, window, cx),
+                    },
+                }
             }
         });
         Self {
@@ -426,7 +458,13 @@ impl Workspace {
         };
         self.text_title = format!("{title}({namespace}/{name})");
         self.flash = Some(format!("loading {title}…"));
-        let rx = k9s_app::fetch_text(self.options.clone(), kind, namespace, name);
+        let rx = k9s_app::fetch_text(
+            self.options.clone(),
+            kind,
+            self.options.kind,
+            namespace,
+            name,
+        );
         let window_handle = window.window_handle();
         self._picker_load = Some(cx.spawn(async move |this, cx| {
             let result = rx.recv().await;
@@ -436,6 +474,9 @@ impl Workspace {
                         this.flash = None;
                         let lines: Vec<String> = text.lines().map(str::to_owned).collect();
                         this.open_picker(PickerKind::Text, &lines, "", window, cx);
+                        if let Some(p) = &this.picker {
+                            p.table.update(cx, |t, cx| t.set_search_mode(true, cx));
+                        }
                     }
                     Ok(Err(e)) => {
                         this.flash = Some(e);
@@ -470,14 +511,19 @@ impl Workspace {
         }
     }
 
-    fn delete_pod(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
+    fn delete_selected(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
         self.flash = Some(format!("deleting {namespace}/{name}…"));
-        let rx = k9s_app::delete_pod(self.options.clone(), namespace.clone(), name.clone());
+        let rx = k9s_app::delete_resource(
+            self.options.clone(),
+            self.options.kind,
+            namespace.clone(),
+            name.clone(),
+        );
         self._picker_load = Some(cx.spawn(async move |this, cx| {
             let result = rx.recv().await;
             let _ = this.update(cx, |this, cx| {
                 this.flash = Some(match result {
-                    Ok(Ok(())) => format!("deleted pod {namespace}/{name}"),
+                    Ok(Ok(())) => format!("deleted {namespace}/{name}"),
                     Ok(Err(e)) => e,
                     Err(_) => "delete failed".into(),
                 });
@@ -495,6 +541,9 @@ impl Workspace {
     /// Opens the container view of the selected pod; with `Some(previous)` a
     /// single-container pod skips straight to its logs.
     fn begin_logs(&mut self, direct: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.options.kind != Kind::Pod {
+            return;
+        }
         let Some((namespace, name)) = self.selected_pod(cx) else {
             return;
         };
@@ -677,7 +726,7 @@ impl Workspace {
             let confirmed = key.key == "y";
             self.close_prompt(window, cx);
             if let (true, Some((ns, name))) = (confirmed, self.pending_delete.take()) {
-                self.delete_pod(ns, name, cx);
+                self.delete_selected(ns, name, cx);
             }
             self.pending_delete = None;
             return;
@@ -749,11 +798,57 @@ impl Workspace {
         }
     }
 
+    fn run_action(&mut self, action: Action, cx: &mut Context<Self>) {
+        let kind = self.options.kind;
+        if self.read_only {
+            self.flash = Some("read-only mode: start with --write to change the cluster".into());
+        } else if !action.supports(kind) {
+            self.flash = Some(format!("{action:?} does not apply to {}", kind.title()));
+        } else if let Some((ns, name)) = self.selected_pod(cx) {
+            self.flash = Some(format!("{action:?} {name}…"));
+            let rx = k9s_app::run_action(self.options.clone(), kind, ns, name, action);
+            self._picker_load = Some(cx.spawn(async move |this, cx| {
+                let result = rx.recv().await;
+                let _ = this.update(cx, |this, cx| {
+                    this.flash = Some(match result {
+                        Ok(Ok(message)) => message,
+                        Ok(Err(e)) => e,
+                        Err(_) => "action failed".into(),
+                    });
+                    cx.notify();
+                });
+            }));
+        }
+        cx.notify();
+    }
+
+    /// Switches to the pod table narrowed by `filter` (drill-down from a workload or node).
+    fn show_pods(&mut self, filter: &str, cx: &mut Context<Self>) {
+        self.run_command("po", cx);
+        self.table.update(cx, |t, cx| t.set_filter(filter, cx));
+    }
+
     fn run_command(&mut self, text: &str, cx: &mut Context<Self>) {
         let mut parts = text.split_whitespace();
         let mut options = self.options.clone();
         match (parts.next(), parts.next()) {
-            (None, _) | (Some("pods" | "pod" | "po"), None) => return,
+            (None, _) => return,
+            (Some(cmd @ ("scale" | "restart" | "cordon" | "uncordon")), arg) => {
+                let action = match (cmd, arg.map(str::parse::<i32>)) {
+                    ("scale", Some(Ok(n))) if n >= 0 => Action::Scale(n),
+                    ("scale", _) => {
+                        self.flash = Some("usage: scale <replicas>".into());
+                        return;
+                    }
+                    ("restart", _) => Action::Restart,
+                    ("cordon", _) => Action::Cordon(true),
+                    _ => Action::Cordon(false),
+                };
+                return self.run_action(action, cx);
+            }
+            (Some(name), None) if Kind::parse(name).is_some() => {
+                options.kind = Kind::parse(name).unwrap_or_default();
+            }
             (Some("q" | "q!" | "quit"), _) => return cx.quit(),
             (Some("ns" | "namespace"), Some("all" | "-A")) => {
                 options.all_namespaces = true;
@@ -777,6 +872,9 @@ impl Workspace {
             return;
         };
         let updates = starter(options.clone());
+        if options.kind != self.options.kind {
+            self.table.update(cx, |t, cx| t.set_filter("", cx));
+        }
         self.options = options;
         self.flash = None;
         self.table
@@ -797,7 +895,7 @@ impl Workspace {
                 self.info = info;
             }
             Update::Stats(stats) => self.stats = stats,
-            Update::Pods(data) => {
+            Update::Table(data) => {
                 self.flash = None;
                 self.table.update(cx, |t, cx| t.set_data(data, cx));
             }
@@ -831,9 +929,15 @@ impl Render for Workspace {
                 PickerKind::Text => format!("{}({rows})", self.text_title),
             }
         } else if self.info.all_namespaces {
-            format!("pods({rows})")
+            format!("{}({rows})", self.options.kind.title())
+        } else if self.options.kind.namespaced() {
+            format!(
+                "{}({}) [{rows}]",
+                self.options.kind.title(),
+                self.info.namespace
+            )
         } else {
-            format!("pods({}) [{rows}]", self.info.namespace)
+            format!("{}({rows})", self.options.kind.title())
         };
         let (wide, faults) = {
             let t = self.table.read(cx);
@@ -847,13 +951,16 @@ impl Render for Workspace {
         }
         if !filter.is_empty() {
             crumb.push_str(&format!(" </{filter}>"));
+            if let Some((at, total)) = self.active_table().read(cx).match_status() {
+                crumb.push_str(&format!(" [{at}/{total}]"));
+            }
         }
         let prompt_text = self.prompt.map(|p| match p {
             Prompt::Filter => format!("/{}▏", self.input),
             Prompt::Command => format!(":{}▏", self.input),
             Prompt::ConfirmDelete => {
                 let (ns, name) = self.pending_delete.clone().unwrap_or_default();
-                format!("Delete pod {ns}/{name}? [y/N]")
+                format!("Delete {} {ns}/{name}? [y/N]", self.options.kind.title())
             }
         });
         let label = |name: &'static str, value: String| {
@@ -1144,7 +1251,7 @@ mod tests {
     fn setup(cx: &mut TestAppContext) -> (Entity<Workspace>, &mut VisualTestContext) {
         cx.update(|cx| cx.bind_keys(key_bindings()));
         let (tx, rx) = async_channel::unbounded();
-        tx.send_blocking(Update::Pods(crate::mock::pods(10_000)))
+        tx.send_blocking(Update::Table(crate::mock::pods(10_000)))
             .unwrap();
         // Keep the sender alive so the update task stays pending after the first message.
         std::mem::forget(tx);
@@ -1332,6 +1439,64 @@ mod tests {
         );
         cx.simulate_keystrokes("n");
         assert!(ws.read_with(cx, |w, _| w.prompt.is_none() && w.pending_delete.is_none()));
+    }
+
+    #[test]
+    fn drill_filters_match_owned_pods_only() {
+        let re = |kind, id| regex::Regex::new(&drill_filter(kind, id).unwrap()).unwrap();
+        let dep = re(Kind::Deployment, "ns/api.v1");
+        assert!(dep.is_match("api.v1-5d9c7b8f6-x2x4z"));
+        assert!(!dep.is_match("api.v1-gateway-5d9c7b8f6-x2x4z"));
+        assert!(!dep.is_match("apixv1-5d9c7b8f6-x2x4z"));
+        assert!(re(Kind::StatefulSet, "ns/db").is_match("db-0"));
+        assert!(drill_filter(Kind::Service, "ns/x").is_none());
+    }
+
+    #[gpui::test]
+    fn actions_are_refused_read_only_and_on_unsupported_kinds(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        cx.run_until_parked();
+        ws.update(cx, |w, cx| w.run_command("scale 3", cx));
+        let flash = ws.read_with(cx, |w, _| w.flash.clone().unwrap_or_default());
+        assert!(flash.contains("read-only"), "{flash}");
+        ws.update(cx, |w, cx| {
+            w.read_only = false;
+            w.run_command("cordon", cx);
+        });
+        let flash = ws.read_with(cx, |w, _| w.flash.clone().unwrap_or_default());
+        assert!(flash.contains("does not apply"), "{flash}");
+    }
+
+    #[gpui::test]
+    fn viewer_search_highlights_and_jumps_between_matches(cx: &mut TestAppContext) {
+        let (ws, cx) = setup(cx);
+        cx.run_until_parked();
+        ws.update_in(cx, |w, window, cx| {
+            let lines: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+            w.open_picker(PickerKind::Text, &lines, "", window, cx);
+            if let Some(p) = &w.picker {
+                p.table.update(cx, |t, cx| t.set_search_mode(true, cx));
+            }
+        });
+        cx.simulate_keystrokes("/");
+        cx.simulate_input("line 4");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let (rows, sel, status) = ws.read_with(cx, |w, cx| {
+            let t = w.active_table().read(cx);
+            (t.row_count(), t.selected(), t.match_status())
+        });
+        assert_eq!((rows, sel, status), (50, 4, Some((1, 11))));
+        cx.simulate_keystrokes("n");
+        assert_eq!(
+            ws.read_with(cx, |w, cx| w.active_table().read(cx).selected()),
+            40
+        );
+        cx.simulate_keystrokes("shift-n");
+        assert_eq!(
+            ws.read_with(cx, |w, cx| w.active_table().read(cx).selected()),
+            4
+        );
     }
 
     #[gpui::test]

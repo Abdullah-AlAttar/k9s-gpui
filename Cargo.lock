@@ -3243,6 +3243,7 @@ dependencies = [
  "k9s_components",
  "k9s_core",
  "k9s_render",
+ "regex",
 ]
 
 [[package]]

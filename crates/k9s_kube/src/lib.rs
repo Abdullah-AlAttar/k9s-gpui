@@ -3,7 +3,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::core::v1::{Event, Pod};
-use k9s_core::{ClusterInfo, ClusterStats, TableData, Update};
+use k9s_core::{ClusterInfo, ClusterStats, Kind, TableData, Update};
 use k9s_render::metrics::{PodMetrics, Usage, parse_cpu_milli, parse_mem_bytes};
 use kube::{
     Api, Client, Config,
@@ -19,6 +19,7 @@ pub struct Options {
     pub context: Option<String>,
     pub namespace: Option<String>,
     pub all_namespaces: bool,
+    pub kind: Kind,
 }
 
 /// Starts the worker thread. Dropping the receiver stops it.
@@ -61,37 +62,27 @@ async fn run(options: Options, tx: async_channel::Sender<Update>) {
         &GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics"),
         "pods",
     );
-    let (api, metrics_api): (Api<Pod>, Api<DynamicObject>) = if info.all_namespaces {
-        (Api::all(client.clone()), Api::all_with(client.clone(), &ar))
+    let metrics_api: Api<DynamicObject> = if info.all_namespaces {
+        Api::all_with(client.clone(), &ar)
     } else {
-        (
-            Api::namespaced(client.clone(), &info.namespace),
-            Api::namespaced_with(client.clone(), &info.namespace, &ar),
-        )
+        Api::namespaced_with(client.clone(), &info.namespace, &ar)
     };
     let mut backoff = REFRESH;
     loop {
-        let update = match api.list(&ListParams::default()).await {
-            Ok(list) => {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+        let update = match list_table(&client, &info, options.kind, &metrics_api, now).await {
+            Ok(table) => {
                 backoff = REFRESH;
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
-                // Without metrics-server this stays `None` and the metric columns are hidden.
-                let metrics = fetch_metrics(&metrics_api).await;
-                Update::Pods(k9s_render::pod::render(
-                    &list.items,
-                    metrics.as_ref(),
-                    info.all_namespaces,
-                    now,
-                ))
+                Update::Table(table)
             }
             Err(e) => {
                 backoff = (backoff * 2).min(MAX_BACKOFF);
-                Update::Error(e.to_string())
+                Update::Error(e)
             }
         };
-        if matches!(update, Update::Pods(_)) {
+        if matches!(update, Update::Table(_)) {
             let stats = fetch_stats(&client).await;
             let _ = tx.try_send(Update::Stats(stats));
         }
@@ -101,6 +92,112 @@ async fn run(options: Options, tx: async_channel::Sender<Update>) {
             Ok(()) | Err(async_channel::TrySendError::Full(_)) => {}
         }
         tokio::time::sleep(backoff).await;
+    }
+}
+
+async fn items<K>(client: &Client, info: &ClusterInfo) -> Result<Vec<K>, String>
+where
+    K: kube::Resource<Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + k8s_openapi::serde::de::DeserializeOwned
+        + std::fmt::Debug,
+    K::DynamicType: Default,
+{
+    let api: Api<K> = if info.all_namespaces {
+        Api::all(client.clone())
+    } else {
+        Api::namespaced(client.clone(), &info.namespace)
+    };
+    let list = api
+        .list(&ListParams::default())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(list.items)
+}
+
+async fn list_table(
+    client: &Client,
+    info: &ClusterInfo,
+    kind: Kind,
+    metrics_api: &Api<DynamicObject>,
+    now: i64,
+) -> Result<TableData, String> {
+    use k8s_openapi::api::{apps::v1 as apps, batch::v1 as batch, core::v1 as core};
+    use k9s_render::resources as r;
+    let all = info.all_namespaces;
+    Ok(match kind {
+        Kind::Pod => {
+            let pods = items::<Pod>(client, info).await?;
+            // Without metrics-server this stays `None` and the metric columns are hidden.
+            let metrics = fetch_metrics(metrics_api).await;
+            k9s_render::pod::render(&pods, metrics.as_ref(), all, now)
+        }
+        Kind::Deployment => {
+            r::deployments(&items::<apps::Deployment>(client, info).await?, all, now)
+        }
+        Kind::StatefulSet => {
+            r::stateful_sets(&items::<apps::StatefulSet>(client, info).await?, all, now)
+        }
+        Kind::DaemonSet => r::daemon_sets(&items::<apps::DaemonSet>(client, info).await?, all, now),
+        Kind::ReplicaSet => {
+            r::replica_sets(&items::<apps::ReplicaSet>(client, info).await?, all, now)
+        }
+        Kind::Job => r::jobs(&items::<batch::Job>(client, info).await?, all, now),
+        Kind::CronJob => r::cron_jobs(&items::<batch::CronJob>(client, info).await?, all, now),
+        Kind::Service => r::services(&items::<core::Service>(client, info).await?, all, now),
+        Kind::Ingress => r::ingresses(
+            &items::<k8s_openapi::api::networking::v1::Ingress>(client, info).await?,
+            all,
+            now,
+        ),
+        Kind::ConfigMap => r::config_maps(&items::<core::ConfigMap>(client, info).await?, all, now),
+        Kind::Secret => r::secrets(&items::<core::Secret>(client, info).await?, all, now),
+        Kind::PersistentVolumeClaim => r::persistent_volume_claims(
+            &items::<core::PersistentVolumeClaim>(client, info).await?,
+            all,
+            now,
+        ),
+        Kind::Event => r::events(&items::<Event>(client, info).await?, all, now),
+        Kind::Node => {
+            let api: Api<core::Node> = Api::all(client.clone());
+            let list = api
+                .list(&ListParams::default())
+                .await
+                .map_err(|e| e.to_string())?;
+            r::nodes(&list.items, all, now)
+        }
+    })
+}
+
+/// Group, version, kind and plural used for dynamic get and delete.
+fn api_resource(kind: Kind) -> ApiResource {
+    let (group, version, name, plural) = match kind {
+        Kind::Pod => ("", "v1", "Pod", "pods"),
+        Kind::Deployment => ("apps", "v1", "Deployment", "deployments"),
+        Kind::StatefulSet => ("apps", "v1", "StatefulSet", "statefulsets"),
+        Kind::DaemonSet => ("apps", "v1", "DaemonSet", "daemonsets"),
+        Kind::ReplicaSet => ("apps", "v1", "ReplicaSet", "replicasets"),
+        Kind::Job => ("batch", "v1", "Job", "jobs"),
+        Kind::CronJob => ("batch", "v1", "CronJob", "cronjobs"),
+        Kind::Service => ("", "v1", "Service", "services"),
+        Kind::Ingress => ("networking.k8s.io", "v1", "Ingress", "ingresses"),
+        Kind::ConfigMap => ("", "v1", "ConfigMap", "configmaps"),
+        Kind::Secret => ("", "v1", "Secret", "secrets"),
+        Kind::PersistentVolumeClaim => {
+            ("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims")
+        }
+        Kind::Event => ("", "v1", "Event", "events"),
+        Kind::Node => ("", "v1", "Node", "nodes"),
+    };
+    ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(group, version, name), plural)
+}
+
+fn dynamic_api(client: Client, kind: Kind, namespace: &str) -> Api<DynamicObject> {
+    let ar = api_resource(kind);
+    if kind.namespaced() && !namespace.is_empty() {
+        Api::namespaced_with(client, namespace, &ar)
+    } else {
+        Api::all_with(client, &ar)
     }
 }
 
@@ -256,6 +353,7 @@ const LOG_TAIL: i64 = 500;
 pub fn fetch_text(
     options: Options,
     kind: TextKind,
+    resource: Kind,
     namespace: String,
     name: String,
 ) -> async_channel::Receiver<Result<String, String>> {
@@ -270,9 +368,9 @@ pub fn fetch_text(
                 .and_then(|rt| {
                     rt.block_on(async {
                         if kind == TextKind::Describe {
-                            describe(&options, &namespace, &name).await
+                            describe(&options, resource, &namespace, &name).await
                         } else {
-                            pod_yaml(&options, &namespace, &name).await
+                            yaml(&options, resource, &namespace, &name).await
                         }
                     })
                 });
@@ -284,42 +382,65 @@ pub fn fetch_text(
     rx
 }
 
-async fn describe(options: &Options, namespace: &str, name: &str) -> Result<String, String> {
+async fn describe(
+    options: &Options,
+    kind: Kind,
+    namespace: &str,
+    name: &str,
+) -> Result<String, String> {
     let (client, _) = connect(options).await.map_err(|e| e.to_string())?;
-    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let pod = pods.get(name).await.map_err(|e| e.to_string())?;
-    let events: Api<Event> = Api::namespaced(client, namespace);
-    let mut params = ListParams::default().fields(&format!(
-        "involvedObject.name={name},involvedObject.kind=Pod"
-    ));
-    if let Some(uid) = &pod.metadata.uid {
-        params = ListParams::default().fields(&format!(
-            "involvedObject.name={name},involvedObject.kind=Pod,involvedObject.uid={uid}"
-        ));
+    let object = dynamic_api(client.clone(), kind, namespace)
+        .get(name)
+        .await
+        .map_err(|e| e.to_string())?;
+    let kind_name = api_resource(kind).kind;
+    let mut selector = format!("involvedObject.name={name},involvedObject.kind={kind_name}");
+    if let Some(uid) = &object.metadata.uid {
+        selector.push_str(&format!(",involvedObject.uid={uid}"));
     }
-    // Missing event permissions should not hide the pod itself.
+    let events: Api<Event> = if kind.namespaced() {
+        Api::namespaced(client.clone(), namespace)
+    } else {
+        Api::namespaced(client.clone(), "default")
+    };
+    // Missing event permissions should not hide the object itself.
     let events = events
-        .list(&params)
+        .list(&ListParams::default().fields(&selector))
         .await
         .map(|l| l.items)
         .unwrap_or_default();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
-    Ok(k9s_render::describe::pod(&pod, &events, now))
+    if kind == Kind::Pod {
+        let pods: Api<Pod> = Api::namespaced(client, namespace);
+        let pod = pods.get(name).await.map_err(|e| e.to_string())?;
+        return Ok(k9s_render::describe::pod(&pod, &events, now));
+    }
+    let manifest = yaml_of(&object)?;
+    Ok(k9s_render::describe::generic(&manifest, &events, now))
 }
 
-async fn pod_yaml(options: &Options, namespace: &str, name: &str) -> Result<String, String> {
-    let (client, _) = connect(options).await.map_err(|e| e.to_string())?;
-    let api: Api<Pod> = Api::namespaced(client, namespace);
-    let pod = api.get(name).await.map_err(|e| e.to_string())?;
-    {
-        let mut value = serde_json::to_value(&pod).map_err(|e| e.to_string())?;
-        if let Some(meta) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            meta.remove("managedFields");
-        }
-        serde_yaml::to_string(&value).map_err(|e| e.to_string())
+fn yaml_of(object: &DynamicObject) -> Result<String, String> {
+    let mut value = serde_json::to_value(object).map_err(|e| e.to_string())?;
+    if let Some(meta) = value.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        meta.remove("managedFields");
     }
+    serde_yaml::to_string(&value).map_err(|e| e.to_string())
+}
+
+async fn yaml(
+    options: &Options,
+    kind: Kind,
+    namespace: &str,
+    name: &str,
+) -> Result<String, String> {
+    let (client, _) = connect(options).await.map_err(|e| e.to_string())?;
+    let object = dynamic_api(client, kind, namespace)
+        .get(name)
+        .await
+        .map_err(|e| e.to_string())?;
+    yaml_of(&object)
 }
 
 /// Container table of one pod, delivered once.
@@ -445,9 +566,10 @@ async fn logs(
     }
 }
 
-/// Deletes one pod on a helper thread; the result is delivered once.
-pub fn delete_pod(
+/// Deletes one resource on a helper thread; the result is delivered once.
+pub fn delete_resource(
     options: Options,
+    kind: Kind,
     namespace: String,
     name: String,
 ) -> async_channel::Receiver<Result<(), String>> {
@@ -459,7 +581,7 @@ pub fn delete_pod(
                 .enable_all()
                 .build()
                 .map_err(|e| e.to_string())
-                .and_then(|rt| rt.block_on(delete(&options, &namespace, &name)));
+                .and_then(|rt| rt.block_on(delete(&options, kind, &namespace, &name)));
             let _ = tx.send_blocking(result);
         });
     if spawned.is_err() {
@@ -468,11 +590,105 @@ pub fn delete_pod(
     rx
 }
 
-async fn delete(options: &Options, namespace: &str, name: &str) -> Result<(), String> {
+async fn delete(options: &Options, kind: Kind, namespace: &str, name: &str) -> Result<(), String> {
     let (client, _) = connect(options).await.map_err(|e| e.to_string())?;
-    let api: Api<Pod> = Api::namespaced(client, namespace);
-    api.delete(name, &kube::api::DeleteParams::default())
+    dynamic_api(client, kind, namespace)
+        .delete(name, &kube::api::DeleteParams::default())
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Mutating actions beyond delete, run from `:scale N`, `:restart`, `:cordon`, `:uncordon`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Scale(i32),
+    Restart,
+    Cordon(bool),
+}
+
+impl Action {
+    /// Whether the action applies to `kind`.
+    pub fn supports(self, kind: Kind) -> bool {
+        match self {
+            Self::Scale(_) => matches!(
+                kind,
+                Kind::Deployment | Kind::StatefulSet | Kind::ReplicaSet
+            ),
+            Self::Restart => matches!(kind, Kind::Deployment | Kind::StatefulSet | Kind::DaemonSet),
+            Self::Cordon(_) => kind == Kind::Node,
+        }
+    }
+}
+
+/// Runs an action on one resource; the confirmation message is delivered once.
+pub fn run_action(
+    options: Options,
+    kind: Kind,
+    namespace: String,
+    name: String,
+    action: Action,
+) -> async_channel::Receiver<Result<String, String>> {
+    let (tx, rx) = async_channel::bounded(1);
+    let spawned = std::thread::Builder::new()
+        .name("k9s-action".into())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| rt.block_on(act(&options, kind, &namespace, &name, action)));
+            let _ = tx.send_blocking(result);
+        });
+    if spawned.is_err() {
+        // The receiver simply sees a closed channel.
+    }
+    rx
+}
+
+async fn act(
+    options: &Options,
+    kind: Kind,
+    namespace: &str,
+    name: &str,
+    action: Action,
+) -> Result<String, String> {
+    use kube::api::{Patch, PatchParams};
+    if !action.supports(kind) {
+        return Err(format!("{action:?} is not supported for {}", kind.title()));
+    }
+    let (client, _) = connect(options).await.map_err(|e| e.to_string())?;
+    let api = dynamic_api(client, kind, namespace);
+    let params = PatchParams::default();
+    match action {
+        Action::Scale(n) => {
+            let patch = serde_json::json!({ "spec": { "replicas": n } });
+            api.patch_scale(name, &params, &Patch::Merge(&patch))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!("scaled {name} to {n}"))
+        }
+        Action::Restart => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let patch = serde_json::json!({ "spec": { "template": { "metadata": { "annotations": {
+                "kubectl.kubernetes.io/restartedAt": now.to_string()
+            } } } } });
+            api.patch(name, &params, &Patch::Merge(&patch))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!("restarting {name}"))
+        }
+        Action::Cordon(on) => {
+            let patch = serde_json::json!({ "spec": { "unschedulable": on } });
+            api.patch(name, &params, &Patch::Merge(&patch))
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "{} {name}",
+                if on { "cordoned" } else { "uncordoned" }
+            ))
+        }
+    }
 }
