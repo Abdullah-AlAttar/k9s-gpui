@@ -64,7 +64,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist-linux-${{ matrix.arch }}
-          path: k9s-gpui-*
+          path: |
+            k9s-gpui-*.tar.gz*
+            k9s-gpui-*.zip*
+            k9s-gpui-*.AppImage*
           if-no-files-found: error
 
   macos:
@@ -98,7 +101,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist-macos-${{ matrix.arch }}
-          path: k9s-gpui-*
+          path: |
+            k9s-gpui-*.tar.gz*
+            k9s-gpui-*.zip*
+            k9s-gpui-*.AppImage*
           if-no-files-found: error
 
   windows:
@@ -124,7 +130,10 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: dist-windows-x86_64
-          path: k9s-gpui-*
+          path: |
+            k9s-gpui-*.tar.gz*
+            k9s-gpui-*.zip*
+            k9s-gpui-*.AppImage*
           if-no-files-found: error
 
   publish:
@@ -142,7 +151,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
+          shopt -s nullglob
           flags=""
           case "$GITHUB_REF_NAME" in *-*) flags="--prerelease" ;; esac
-          gh release create "$GITHUB_REF_NAME" k9s-gpui-* \
+          gh release create "$GITHUB_REF_NAME" k9s-gpui-*.tar.gz* k9s-gpui-*.zip* k9s-gpui-*.AppImage* \
             --title "$GITHUB_REF_NAME" --generate-notes $flags
