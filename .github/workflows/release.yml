@@ -11,46 +11,132 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
+  validate:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - name: System libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            libxcb1-dev libxcb-xkb-dev libx11-xcb-dev libfontconfig-dev libfreetype-dev \
-            libvulkan-dev libssl-dev
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Check tag matches Cargo version
         run: |
           v=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="k9s"))')
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME != Cargo version v$v"; exit 1; }
-      - run: cargo build --release --locked -p k9s
-      - name: Package
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, os: ubuntu-24.04 }
+          - { arch: aarch64, os: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: target
+          key: release-linux-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+      # Built in Ubuntu 22.04 so neither the binary nor the bundled libraries
+      # need the runner's newer glibc.
+      - name: Build in Ubuntu 22.04
         run: |
-          name="k9s-gpui-${GITHUB_REF_NAME}-x86_64-linux"
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -v "$HOME/.cargo:/rust/cargo" -v "$HOME/.rustup:/rust/rustup" \
+            -e CARGO_HOME=/rust/cargo -e RUSTUP_HOME=/rust/rustup \
+            ubuntu:22.04 bash scripts/appimage-build.sh
+          sudo chown -R "$(id -u):$(id -g)" target AppDir "$HOME/.cargo" "$HOME/.rustup"
+      - name: Package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          name="k9s-gpui-${GITHUB_REF_NAME}-linux-${ARCH}"
           mkdir "$name"
           cp target/release/k9s-gpui LICENSE "$name"/
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          curl -fsSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${ARCH}.AppImage"
+          chmod +x appimagetool
+          APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool --no-appstream AppDir "$name.AppImage"
+          sha256sum "$name.AppImage" > "$name.AppImage.sha256"
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
-          path: k9s-gpui-*.tar.gz*
+          name: dist-linux-${{ matrix.arch }}
+          path: k9s-gpui-*
+          if-no-files-found: error
+
+  macos:
+    name: macOS ${{ matrix.arch }}
+    needs: validate
+    runs-on: macos-15
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: arm64, target: aarch64-apple-darwin }
+          # Cross-compiled on Apple Silicon; the Intel runners are scarce and slow.
+          - { arch: x86_64, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo build --release --locked -p k9s --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          name="k9s-gpui-${GITHUB_REF_NAME}-macos-${{ matrix.arch }}"
+          mkdir "$name"
+          cp target/${{ matrix.target }}/release/k9s-gpui LICENSE "$name"/
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-macos-${{ matrix.arch }}
+          path: k9s-gpui-*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64
+    needs: validate
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+      - run: cargo build --release --locked -p k9s
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "k9s-gpui-$env:GITHUB_REF_NAME-windows-x86_64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/k9s-gpui.exe, LICENSE $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-windows-x86_64
+          path: k9s-gpui-*
+          if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [linux, macos, windows]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

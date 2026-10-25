@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=k9s-gpui
+Comment=Native GPU-accelerated Kubernetes UI
+Exec=k9s-gpui
+Icon=k9s-gpui
+Categories=Development;System;
+Terminal=false
