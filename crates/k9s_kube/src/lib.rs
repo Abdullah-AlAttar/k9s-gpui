@@ -2,7 +2,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Event, Pod};
 use k9s_core::{ClusterInfo, ClusterStats, TableData, Update};
 use k9s_render::metrics::{PodMetrics, Usage, parse_cpu_milli, parse_mem_bytes};
 use kube::{
@@ -263,15 +263,19 @@ pub fn fetch_text(
     let spawned = std::thread::Builder::new()
         .name("k9s-text".into())
         .spawn(move || {
-            let result = if kind == TextKind::Describe {
-                describe(&options, &namespace, &name)
-            } else {
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| e.to_string())
-                    .and_then(|rt| rt.block_on(pod_yaml(&options, &namespace, &name)))
-            };
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())
+                .and_then(|rt| {
+                    rt.block_on(async {
+                        if kind == TextKind::Describe {
+                            describe(&options, &namespace, &name).await
+                        } else {
+                            pod_yaml(&options, &namespace, &name).await
+                        }
+                    })
+                });
             let _ = tx.send_blocking(result);
         });
     if spawned.is_err() {
@@ -280,21 +284,29 @@ pub fn fetch_text(
     rx
 }
 
-/// `kubectl describe` is the reference output; reimplementing it is not worth it yet.
-fn describe(options: &Options, namespace: &str, name: &str) -> Result<String, String> {
-    let mut cmd = std::process::Command::new("kubectl");
-    if let Some(ctx) = &options.context {
-        cmd.args(["--context", ctx]);
+async fn describe(options: &Options, namespace: &str, name: &str) -> Result<String, String> {
+    let (client, _) = connect(options).await.map_err(|e| e.to_string())?;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod = pods.get(name).await.map_err(|e| e.to_string())?;
+    let events: Api<Event> = Api::namespaced(client, namespace);
+    let mut params = ListParams::default().fields(&format!(
+        "involvedObject.name={name},involvedObject.kind=Pod"
+    ));
+    if let Some(uid) = &pod.metadata.uid {
+        params = ListParams::default().fields(&format!(
+            "involvedObject.name={name},involvedObject.kind=Pod,involvedObject.uid={uid}"
+        ));
     }
-    let out = cmd
-        .args(["describe", "pod", name, "-n", namespace])
-        .output()
-        .map_err(|e| format!("kubectl: {e}"))?;
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    } else {
-        Err(String::from_utf8_lossy(&out.stderr).trim().to_owned())
-    }
+    // Missing event permissions should not hide the pod itself.
+    let events = events
+        .list(&params)
+        .await
+        .map(|l| l.items)
+        .unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0));
+    Ok(k9s_render::describe::pod(&pod, &events, now))
 }
 
 async fn pod_yaml(options: &Options, namespace: &str, name: &str) -> Result<String, String> {

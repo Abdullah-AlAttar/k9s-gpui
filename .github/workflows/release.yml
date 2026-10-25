@@ -34,7 +34,7 @@ jobs:
         run: |
           name="k9s-gpui-${GITHUB_REF_NAME}-x86_64-linux"
           mkdir "$name"
-          cp target/release/k9s LICENSE "$name"/
+          cp target/release/k9s-gpui LICENSE "$name"/
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
       - uses: actions/upload-artifact@v4

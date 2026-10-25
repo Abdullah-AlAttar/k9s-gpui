@@ -114,7 +114,7 @@ new view = one module in `k9s_ui/views`.
 Verified: `task ci` (29 tests, 4 live tests ignored) and live against `dev/varia`. Never checked: delete on a real cluster, GPU selection, hi-dpi.
 
 ## Known gaps / cleanup candidates
-- `d` describe shells out to `kubectl`; everything else uses `kube` + `k8s-openapi`.
+- No `kubectl` dependency: `d` describe is native (`k9s_render::describe`, Pod + Events); everything uses `kube` + `k8s-openapi`.
 - Wrap width is fixed when toggled (not recomputed on zoom/resize); filter matches wrapped pieces, not whole lines.
 - No mouse text selection (keyboard copy only); no horizontal scroll; column widths are not content-based.
 - Favourites and last namespace are not persisted; `k9s_config` is a stub.
@@ -127,7 +127,6 @@ Verified: `task ci` (29 tests, 4 live tests ignored) and live against `dev/varia
 Autocomplete for `:`, `-l` label selectors, per-context config (persisted favourites, last namespace).
 
 ### N4b — Pod actions
-1. Native describe (Pod + Events) to drop `kubectl`.
 2. Log toggles: timestamps, tail length, level filter, expand one JSON line.
 3. `e` edit: in-app editor view (own or `gpui-component`), server-side apply; no `$EDITOR`.
 4. `s` shell / `a` attach: Herdr-style PTY + terminal emulator + cell painter, last.
