@@ -1,0 +1,52 @@
+version: "3"
+
+tasks:
+  default:
+    cmds:
+      - task --list
+    silent: true
+
+  fmt:
+    desc: Format the workspace
+    cmds:
+      - cargo fmt --all
+
+  format-check:
+    desc: Check formatting
+    cmds:
+      - cargo fmt --all -- --check
+
+  check:
+    desc: cargo check
+    cmds:
+      - cargo check --workspace --all-targets
+
+  clippy:
+    desc: Clippy with warnings denied
+    cmds:
+      - cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    desc: Run tests (nextest)
+    cmds:
+      - cargo nextest run --workspace --no-tests=pass
+
+  ci:
+    desc: format-check + clippy + test
+    cmds:
+      - task: format-check
+      - task: clippy
+      - task: test
+
+  run:
+    desc: Run a debug build (extra args after --)
+    cmds:
+      - cargo run -p k9s -- {{.CLI_ARGS}}
+
+  run-release:
+    desc: Run an optimised build on the NVIDIA GPU (extra args after --)
+    env:
+      __NV_PRIME_RENDER_OFFLOAD: "1"
+      __VK_LAYER_NV_optimus: NVIDIA_only
+    cmds:
+      - cargo run --release -p k9s -- {{.CLI_ARGS}}

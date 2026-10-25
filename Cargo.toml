@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+default-members = ["crates/k9s"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+k9s_core = { path = "crates/k9s_core" }
+k9s_render = { path = "crates/k9s_render" }
+k9s_kube = { path = "crates/k9s_kube" }
+k9s_config = { path = "crates/k9s_config" }
+k9s_app = { path = "crates/k9s_app" }
+k9s_components = { path = "crates/k9s_components" }
+k9s_ui = { path = "crates/k9s_ui" }
+
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+unused_must_use = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

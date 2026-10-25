@@ -1,0 +1,15 @@
+[package]
+name = "k9s_app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k9s_core = { workspace = true }
+k9s_kube = { workspace = true }
+k9s_config = { workspace = true }
+async-channel = "2.5.0"

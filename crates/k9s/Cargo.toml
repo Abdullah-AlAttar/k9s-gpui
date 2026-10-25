@@ -1,0 +1,15 @@
+[package]
+name = "k9s"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+k9s_ui = { workspace = true }
+k9s_app = { workspace = true }
+gpui = { workspace = true }
+gpui_platform = { workspace = true }
