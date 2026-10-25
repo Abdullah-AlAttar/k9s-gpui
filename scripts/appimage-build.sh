@@ -12,8 +12,8 @@ apt-get install -y --no-install-recommends \
   libx11-xcb-dev libfontconfig-dev libfreetype-dev libvulkan-dev libssl-dev
 
 export PATH="${CARGO_HOME}/bin:$PATH"
-# Jammy's gcc cannot use mold (.cargo/config.toml); this env var overrides the config rustflags.
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C debuginfo=0"
+# Jammy's gcc cannot use mold (.cargo/config.toml); RUSTFLAGS replaces the config rustflags entirely.
+export RUSTFLAGS="-C debuginfo=0"
 cargo build --release --locked -p k9s
 
 appdir=AppDir
